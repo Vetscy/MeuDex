@@ -3,6 +3,8 @@
 
     <!-- Única permissão: encerrar processos em segundo plano (botão "Fechar" da barra de tarefas) -->
     <uses-permission android:name="android.permission.KILL_BACKGROUND_PROCESSES" />
+    <!-- Ícone de Wi-Fi da bandeja -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
     <!-- Android 11+: sem isso a lista de apps instalados vem vazia -->
     <queries>
