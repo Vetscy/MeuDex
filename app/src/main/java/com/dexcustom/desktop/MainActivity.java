@@ -19,6 +19,7 @@ import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.Rect;
 import android.graphics.RectF;
+import android.graphics.Typeface;
 import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
@@ -60,27 +61,45 @@ import java.io.InputStream;
 import java.text.Normalizer;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
- * Meu Dex v0.2 - launcher estilo Samsung DeX para a tela virtual do scrcpy.
+ * Meu Dex v0.3 - launcher estilo Samsung DeX para a tela virtual do scrcpy.
  *
- * Técnica central:
- *   ActivityOptions.setLaunchDisplayId(id)  -> abre o app NA tela virtual, não no celular
- *   ActivityOptions.setLaunchBounds(rect)   -> posição/tamanho da "janela" (depende do firmware)
+ * Novidades da v0.3:
+ *  - Barra de tarefas no layout do DeX: navegacao (recentes/inicio/voltar) a esquerda, busca + apps + favoritos
+ *    + apps abertos no centro, bandeja (volume/wifi/bateria/relogio) a direita.
+ *  - Menu de apps em painel flutuante (como o DeX) com busca embaixo; digitar em qualquer lugar ja pesquisa.
+ *  - Apps abrem em JANELA (freeform) dentro da area acima da barra; maximizar NAO cobre a barra de tarefas.
+ *    Modos por app: janela / maximizado / tela cheia. O modo escolhido e lembrado.
+ *  - Versao visivel (canto do desktop e rodape do menu de apps).
+ *  - Desktop, favoritos da barra e modos dos apps sao enviados ao PC (meudex_apps.json) e restaurados
+ *    se o launcher for reinstalado.
  *
  * Canal com o PC: o launcher escreve linhas no logcat (tag "MeuDex") e o PC responde com
- * "am start --es cmd ..." (ver meudex.py). É assim que o botão Voltar e os atalhos Win/Alt+Tab funcionam.
+ * "am start --es cmd ..." (ver meudex.py). O PC tambem executa as acoes que um app comum nao pode fazer:
+ * forcar modo janela, redimensionar uma janela existente e fechar (force-stop) um app.
  */
 public class MainActivity extends Activity {
+
+    static final String VERSION = "0.3";
 
     private static final String TAG = "MeuDex";
     private static final String PREFS = "meudex_prefs";
     private static final String KEY_SHORTCUTS = "shortcuts";
+    private static final String KEY_PINNED = "pinned";
+    private static final String KEY_MODES = "modes";
     private static final String KEY_WALL = "wallpaper";
     private static final long LAUNCH_DEBOUNCE_MS = 300;
-    private static final int BAR_H_DP = 48;
+    private static final int BAR_H_DP = 52;
     private static final int REQ_WALL = 77;
+
+    // Modo de abertura de cada app
+    private static final int MODE_WINDOW = 0, MODE_MAX = 1, MODE_FULL = 2;
+    // Windowing modes do Android (WindowConfiguration)
+    private static final int WM_FULLSCREEN = 1, WM_FREEFORM = 5;
 
     private static final int[][] PRESETS = {
             {0xFF0B1F4D, 0xFF1D4ED8, 0xFF7C3AED},
@@ -102,17 +121,22 @@ public class MainActivity extends Activity {
     private SharedPreferences prefs;
     private final List<AppEntry> allApps = new ArrayList<>();
     private final List<AppEntry> filtered = new ArrayList<>();
-    private final List<String> shortcuts = new ArrayList<>();
+    private final List<String> shortcuts = new ArrayList<>();   // ícones do desktop
+    private final List<String> pinned = new ArrayList<>();      // favoritos da barra de tarefas
+    private final Map<String, Integer> modes = new HashMap<>(); // modo de abertura lembrado por app
     private final List<String> running = new ArrayList<>();
     private String activePkg;
+    private boolean desktopShown = false;
 
-    private FrameLayout rootFrame, desktopArea, drawer;
+    private FrameLayout rootFrame, desktopArea, startScrim;
+    private LinearLayout startPanel;
     private ImageView wallpaperImage;
-    private ColumnFlow shortcutContainer;
+    private BottomFlow iconFlow;
     private LinearLayout taskbarStrip;
-    private TextView emptyHint, batteryText;
-    private Glyph batteryGlyph, wifiGlyph;
+    private TextView emptyHint, batteryBadge;
+    private Glyph wifiGlyph;
     private EditText searchBox;
+    private GridView startGrid;
     private DrawerAdapter drawerAdapter;
     private View hoverCard, recentsPanel, volumePanel;
 
@@ -136,13 +160,14 @@ public class MainActivity extends Activity {
         pm = getPackageManager();
         prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
         loadApps();
-        loadShortcuts();
+        loadState();
         setContentView(buildUi());
         applyWallpaper();
-        refreshShortcuts();
+        refreshDesktopIcons();
         refreshTaskbar();
         registerStatus();
-        Log.i(TAG, "ready display=" + displayId());
+        // O PC le esta linha: id da tela virtual + versao do launcher instalado.
+        Log.i(TAG, "ready display=" + displayId() + " version=" + VERSION);
         handleCommand(getIntent());
     }
 
@@ -182,22 +207,27 @@ public class MainActivity extends Activity {
         if (anyOverlayOpen()) closeOverlays();
     }
 
-    /** Comandos vindos do PC: am start --es cmd start|cycle|home */
+    /** Comandos vindos do PC: am start --es cmd start|cycle|home|closeactive|import [--es data ...] */
     private void handleCommand(Intent i) {
         if (i == null) return;
-        String cmd = i.getStringExtra("cmd");
+        final String cmd = i.getStringExtra("cmd");
+        final String data = i.getStringExtra("data");
         if (cmd == null) return;
         i.removeExtra("cmd");
+        i.removeExtra("data");
         rootFrame.post(() -> {
             switch (cmd) {
-                case "start": showDrawer(); break;
+                case "start": toggleDrawer(); break;
                 case "cycle": cycleWindows(); break;
-                case "home": closeOverlays(); break;
+                case "home": showDesktop(); break;
+                case "closeactive": if (activePkg != null) closeApp(activePkg); break;
+                case "import": if (data != null) importState(data); break;
+                default: break;
             }
         });
     }
 
-    /** Win (solto sozinho) abre o Iniciar; Alt+Tab troca de janela; Esc fecha painéis. */
+    /** Win abre o Iniciar; Alt+Tab troca de janela; Esc fecha painéis; digitar já pesquisa apps. */
     @Override
     public boolean dispatchKeyEvent(KeyEvent e) {
         int k = e.getKeyCode();
@@ -213,6 +243,18 @@ public class MainActivity extends Activity {
             if (e.getAction() == KeyEvent.ACTION_UP) closeOverlays();
             return true;
         }
+        // Digitar com o desktop em foco abre o menu de apps já com o texto na busca.
+        if (e.getAction() == KeyEvent.ACTION_DOWN && !drawerOpen()
+                && !e.isCtrlPressed() && !e.isAltPressed() && !e.isMetaPressed()) {
+            int u = e.getUnicodeChar();
+            if (u > 32 && !Character.isISOControl(u)) {
+                showDrawer();
+                String s = new String(Character.toChars(u));
+                searchBox.setText(s);
+                searchBox.setSelection(s.length());
+                return true;
+            }
+        }
         return super.dispatchKeyEvent(e);
     }
 
@@ -221,6 +263,10 @@ public class MainActivity extends Activity {
     private static String norm(CharSequence s) {
         return Normalizer.normalize(s, Normalizer.Form.NFD)
                 .replaceAll("\\p{M}", "").toLowerCase();
+    }
+
+    private static boolean safePkg(String p) {
+        return p.matches("[A-Za-z0-9._]+");
     }
 
     private void loadApps() {
@@ -245,15 +291,87 @@ public class MainActivity extends Activity {
         return null;
     }
 
-    private void loadShortcuts() {
-        shortcuts.clear();
-        for (String p : prefs.getString(KEY_SHORTCUTS, "").split(",")) {
-            if (!p.isEmpty() && find(p) != null) shortcuts.add(p);
+    // ---- estado salvo (desktop, favoritos, modos) ----
+
+    private static void fillList(List<String> out, String csv) {
+        out.clear();
+        for (String p : csv.split(",")) {
+            p = p.trim();
+            if (!p.isEmpty() && safePkg(p) && !out.contains(p)) out.add(p);
         }
     }
 
-    private void saveShortcuts() {
-        prefs.edit().putString(KEY_SHORTCUTS, String.join(",", shortcuts)).apply();
+    private void fillModes(String csv) {
+        modes.clear();
+        for (String s : csv.split(",")) {
+            int i = s.lastIndexOf(':');
+            if (i <= 0) continue;
+            String pkg = s.substring(0, i);
+            if (!safePkg(pkg)) continue;
+            try { modes.put(pkg, Integer.parseInt(s.substring(i + 1))); }
+            catch (NumberFormatException ignored) { }
+        }
+    }
+
+    private String modesCsv() {
+        List<String> parts = new ArrayList<>();
+        for (Map.Entry<String, Integer> en : modes.entrySet())
+            if (en.getValue() != MODE_WINDOW) parts.add(en.getKey() + ":" + en.getValue());
+        return TextUtils.join(",", parts);
+    }
+
+    private void loadState() {
+        fillList(shortcuts, prefs.getString(KEY_SHORTCUTS, ""));
+        fillList(pinned, prefs.getString(KEY_PINNED, ""));
+        fillModes(prefs.getString(KEY_MODES, ""));
+    }
+
+    /** Formato simples (só caracteres seguros para o shell do adb): d=a,b@p=c@m=x:1@w=preset:0 */
+    private String encodeState() {
+        String w = prefs.getString(KEY_WALL, "preset:0");
+        if (!w.matches("[A-Za-z0-9:_]+")) w = "preset:0";
+        return "d=" + TextUtils.join(",", shortcuts) + "@p=" + TextUtils.join(",", pinned)
+                + "@m=" + modesCsv() + "@w=" + w;
+    }
+
+    private void logState() {
+        Log.i(TAG, "state " + encodeState());
+    }
+
+    private void saveState() {
+        prefs.edit()
+                .putString(KEY_SHORTCUTS, TextUtils.join(",", shortcuts))
+                .putString(KEY_PINNED, TextUtils.join(",", pinned))
+                .putString(KEY_MODES, modesCsv())
+                .apply();
+        logState(); // o PC guarda uma cópia em meudex_apps.json
+    }
+
+    /** Restaura o que o PC guardou (útil depois de reinstalar o launcher). */
+    private void importState(String s) {
+        for (String part : s.split("@")) {
+            int i = part.indexOf('=');
+            if (i < 0) continue;
+            String k = part.substring(0, i), v = part.substring(i + 1);
+            switch (k) {
+                case "d": fillList(shortcuts, v); break;
+                case "p": fillList(pinned, v); break;
+                case "m": fillModes(v); break;
+                case "w":
+                    if (v.matches("preset:\\d+")) prefs.edit().putString(KEY_WALL, v).apply();
+                    break;
+                default: break;
+            }
+        }
+        prefs.edit()
+                .putString(KEY_SHORTCUTS, TextUtils.join(",", shortcuts))
+                .putString(KEY_PINNED, TextUtils.join(",", pinned))
+                .putString(KEY_MODES, modesCsv())
+                .apply();
+        applyWallpaper();
+        refreshDesktopIcons();
+        refreshTaskbar();
+        Log.i(TAG, "imported d=" + shortcuts.size() + " p=" + pinned.size());
     }
 
     // ------------------------------------------------------------------ UI base
@@ -266,7 +384,8 @@ public class MainActivity extends Activity {
         rootFrame.addView(wallpaperImage, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
-        // Área útil do desktop (acima da barra). Também é a referência para as "janelas".
+        // Área útil do desktop (acima da barra). Também é a referência para as "janelas":
+        // maximizar usa exatamente esta área, então a barra de tarefas nunca fica coberta.
         desktopArea = new FrameLayout(this);
         FrameLayout.LayoutParams dlp = new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
@@ -275,8 +394,9 @@ public class MainActivity extends Activity {
         desktopArea.setOnClickListener(v -> closeOverlays());
         desktopArea.setOnLongClickListener(v -> { showDesktopMenu(); return true; });
 
-        shortcutContainer = new ColumnFlow(this, dp(96), dp(108));
-        desktopArea.addView(shortcutContainer, new FrameLayout.LayoutParams(
+        // Ícones do desktop: fileira centralizada na parte de baixo, como no DeX.
+        iconFlow = new BottomFlow(this, dp(100), dp(108), dp(14));
+        desktopArea.addView(iconFlow, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
         emptyHint = new TextView(this);
@@ -287,7 +407,20 @@ public class MainActivity extends Activity {
         desktopArea.addView(emptyHint, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER));
 
-        buildDrawer();
+        // Marca de versão no canto: confirma de relance que o APK novo está instalado.
+        TextView ver = new TextView(this);
+        ver.setText("Meu Dex v" + VERSION);
+        ver.setTextColor(0x99FFFFFF);
+        ver.setTextSize(11);
+        ver.setShadowLayer(3f, 0f, 1f, Color.BLACK);
+        FrameLayout.LayoutParams vlp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.TOP | Gravity.END);
+        vlp.topMargin = dp(8);
+        vlp.rightMargin = dp(14);
+        desktopArea.addView(ver, vlp);
+
+        buildStart();
 
         FrameLayout.LayoutParams blp = new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, dp(BAR_H_DP), Gravity.BOTTOM);
@@ -299,20 +432,13 @@ public class MainActivity extends Activity {
 
     private View buildTaskbar() {
         FrameLayout bar = new FrameLayout(this);
-        bar.setBackgroundColor(0xE6101216);
+        bar.setBackgroundColor(0xF0121417);
 
-        // Esquerda: apps | busca | recentes, início, voltar
+        // Esquerda: navegação (recentes, início, voltar)
         LinearLayout left = row();
-        left.setPadding(dp(10), 0, 0, 0);
-        addTool(left, Glyph.GRID, v -> toggleDrawer());
-        addTool(left, Glyph.SEARCH, v -> showDrawer());
-        View div = new View(this);
-        div.setBackgroundColor(0x44FFFFFF);
-        LinearLayout.LayoutParams divLp = new LinearLayout.LayoutParams(dp(1), dp(20));
-        divLp.setMargins(dp(8), 0, dp(8), 0);
-        left.addView(div, divLp);
+        left.setPadding(dp(14), 0, 0, 0);
         addTool(left, Glyph.RECENTS, v -> toggleRecents());
-        addTool(left, Glyph.HOME, v -> { closeOverlays(); bringLauncherToFront(); });
+        addTool(left, Glyph.HOME, v -> showDesktop());
         addTool(left, Glyph.BACK, v -> {
             if (anyOverlayOpen()) closeOverlays();
             else Log.i(TAG, "cmd=back display=" + displayId()); // o PC injeta o Voltar na tela virtual
@@ -320,26 +446,55 @@ public class MainActivity extends Activity {
         bar.addView(left, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT, Gravity.START));
 
-        // Centro: apps abertos
+        // Centro: busca | apps | favoritos + apps abertos
+        LinearLayout center = row();
+
+        LinearLayout pill = row();
+        pill.setPadding(dp(10), 0, dp(14), 0);
+        pill.setBackground(roundRect(0x26FFFFFF, dp(20)));
+        pill.addView(new Glyph(this, Glyph.SEARCH), new LinearLayout.LayoutParams(dp(26), dp(26)));
+        TextView pillTxt = new TextView(this);
+        pillTxt.setText("Pesquisar apps");
+        pillTxt.setTextColor(0xCCFFFFFF);
+        pillTxt.setTextSize(13);
+        pillTxt.setPadding(dp(6), 0, 0, 0);
+        pill.addView(pillTxt);
+        pill.setOnClickListener(v -> showDrawer());
+        hoverBg(pill, 0x3AFFFFFF, dp(20));
+        LinearLayout.LayoutParams pillLp = new LinearLayout.LayoutParams(dp(176), dp(36));
+        pillLp.rightMargin = dp(8);
+        center.addView(pill, pillLp);
+
+        addTool(center, Glyph.GRID, v -> toggleDrawer());
+
+        View div = new View(this);
+        div.setBackgroundColor(0x44FFFFFF);
+        LinearLayout.LayoutParams divLp = new LinearLayout.LayoutParams(dp(1), dp(22));
+        divLp.setMargins(dp(8), 0, dp(8), 0);
+        center.addView(div, divLp);
+
         taskbarStrip = row();
-        bar.addView(taskbarStrip, new FrameLayout.LayoutParams(
+        center.addView(taskbarStrip, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        bar.addView(center, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT,
                 Gravity.CENTER_HORIZONTAL));
 
         // Direita: bandeja
         LinearLayout right = row();
-        right.setPadding(0, 0, dp(14), 0);
+        right.setPadding(0, 0, dp(16), 0);
         addTool(right, Glyph.VOLUME, v -> toggleVolume());
         wifiGlyph = addTool(right, Glyph.WIFI, null);
-        batteryGlyph = new Glyph(this, Glyph.BATTERY);
-        right.addView(batteryGlyph, new LinearLayout.LayoutParams(dp(34), dp(40)));
-        batteryText = new TextView(this);
-        batteryText.setTextColor(Color.WHITE);
-        batteryText.setTextSize(12);
-        LinearLayout.LayoutParams btLp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        btLp.rightMargin = dp(12);
-        right.addView(batteryText, btLp);
+
+        batteryBadge = new TextView(this);
+        batteryBadge.setTextColor(0xFF111111);
+        batteryBadge.setTextSize(11);
+        batteryBadge.setTypeface(null, Typeface.BOLD);
+        batteryBadge.setGravity(Gravity.CENTER);
+        batteryBadge.setBackground(roundRect(0xFFFFFFFF, dp(13)));
+        LinearLayout.LayoutParams bbLp = new LinearLayout.LayoutParams(dp(30), dp(24));
+        bbLp.setMargins(dp(6), 0, dp(14), 0);
+        right.addView(batteryBadge, bbLp);
 
         LinearLayout clockBox = new LinearLayout(this);
         clockBox.setOrientation(LinearLayout.VERTICAL);
@@ -388,12 +543,16 @@ public class MainActivity extends Activity {
         });
     }
 
+    /** Favoritos (fixos) primeiro, depois os apps abertos que não são favoritos. */
     private void refreshTaskbar() {
         taskbarStrip.removeAllViews();
-        for (String pkg : running) {
-            AppEntry e = find(pkg);
+        List<String> items = new ArrayList<>(pinned);
+        for (String p : running) if (!items.contains(p)) items.add(p);
+        for (String pkg : items) {
+            final AppEntry e = find(pkg);
             if (e == null) continue;
-            boolean act = pkg.equals(activePkg);
+            final boolean isRun = running.contains(pkg);
+            final boolean act = isRun && pkg.equals(activePkg) && !desktopShown;
 
             LinearLayout slot = new LinearLayout(this);
             slot.setOrientation(LinearLayout.VERTICAL);
@@ -401,25 +560,34 @@ public class MainActivity extends Activity {
 
             View ind = new View(this);
             ind.setBackground(roundRect(act ? 0xFFFFFFFF : 0x99FFFFFF, dp(2)));
+            ind.setVisibility(isRun ? View.VISIBLE : View.INVISIBLE);
             slot.addView(ind, new LinearLayout.LayoutParams(dp(act ? 16 : 6), dp(3)));
 
             ImageView iv = new ImageView(this);
             iv.setImageDrawable(e.icon);
             iv.setPadding(dp(3), dp(3), dp(3), dp(3));
-            LinearLayout.LayoutParams ilp = new LinearLayout.LayoutParams(dp(34), dp(34));
+            LinearLayout.LayoutParams ilp = new LinearLayout.LayoutParams(dp(36), dp(36));
             ilp.topMargin = dp(3);
             slot.addView(iv, ilp);
 
-            slot.setOnClickListener(v -> launch(pkg, null));
-            slot.setOnLongClickListener(v -> { showWindowMenu(e); return true; });
+            slot.setOnClickListener(v -> {
+                if (act) showDesktop();           // clicar no app ativo = minimizar (mostra o desktop)
+                else launchApp(pkg);
+            });
+            slot.setOnLongClickListener(v -> {
+                if (isRun) showWindowMenu(e); else showAppMenu(e);
+                return true;
+            });
             slot.setOnHoverListener((v, ev) -> {
                 int a = ev.getAction();
                 if (a == MotionEvent.ACTION_HOVER_ENTER) {
                     v.setBackground(roundRect(0x26FFFFFF, dp(8)));
-                    handler.removeCallbacks(hideRunnable);
-                    handler.removeCallbacks(showRunnable);
-                    showRunnable = () -> showHoverCard(v, e);
-                    handler.postDelayed(showRunnable, 200);
+                    if (isRun) {
+                        handler.removeCallbacks(hideRunnable);
+                        handler.removeCallbacks(showRunnable);
+                        showRunnable = () -> showHoverCard(v, e);
+                        handler.postDelayed(showRunnable, 200);
+                    }
                 } else if (a == MotionEvent.ACTION_HOVER_EXIT) {
                     v.setBackground(null);
                     handler.removeCallbacks(showRunnable);
@@ -427,7 +595,7 @@ public class MainActivity extends Activity {
                 }
                 return false;
             });
-            taskbarStrip.addView(slot, new LinearLayout.LayoutParams(dp(46),
+            taskbarStrip.addView(slot, new LinearLayout.LayoutParams(dp(48),
                     ViewGroup.LayoutParams.MATCH_PARENT));
         }
     }
@@ -462,7 +630,7 @@ public class MainActivity extends Activity {
         card.setPadding(dp(10), dp(8), dp(10), dp(10));
         card.setBackground(roundRect(0xF2181C26, dp(12)));
         card.setOnHoverListener(cardHover);
-        card.setOnClickListener(v -> launch(e.pkg, null));
+        card.setOnClickListener(v -> launchApp(e.pkg));
 
         LinearLayout head = row();
         ImageView ic = new ImageView(this);
@@ -487,8 +655,7 @@ public class MainActivity extends Activity {
         card.addView(head, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        // Obs.: um app normal não consegue capturar a imagem da janela de outro app, então
-        // o "preview" mostra o ícone grande. Miniatura real exigiria captura via PC (adb screencap).
+        // Um app normal não consegue capturar a janela de outro app: o "preview" mostra o ícone grande.
         FrameLayout prev = new FrameLayout(this);
         prev.setBackground(roundRect(0xFF0E1118, dp(8)));
         ImageView big = new ImageView(this);
@@ -512,85 +679,119 @@ public class MainActivity extends Activity {
         rootFrame.addView(card, lp);
     }
 
-    // ------------------------------------------------------------------ menu de apps + busca
+    // ------------------------------------------------------------------ menu de apps (painel do DeX) + busca
 
-    private void buildDrawer() {
-        drawer = new FrameLayout(this);
-        drawer.setBackgroundColor(0xE60B0F1A);
-        drawer.setVisibility(View.GONE);
-        drawer.setClickable(true);
-        drawer.setOnClickListener(v -> hideDrawer());
+    private void buildStart() {
+        startScrim = new FrameLayout(this);
+        startScrim.setBackgroundColor(0x55000000);
+        startScrim.setVisibility(View.GONE);
+        startScrim.setClickable(true);
+        startScrim.setOnClickListener(v -> hideDrawer());
 
-        LinearLayout col = new LinearLayout(this);
-        col.setOrientation(LinearLayout.VERTICAL);
-        col.setGravity(Gravity.CENTER_HORIZONTAL);
-        col.setPadding(dp(48), dp(28), dp(48), dp(16));
+        startPanel = new LinearLayout(this);
+        startPanel.setOrientation(LinearLayout.VERTICAL);
+        startPanel.setPadding(dp(22), dp(22), dp(22), dp(16));
+        startPanel.setBackground(roundRect(0xF01C1F24, dp(30)));
+        startPanel.setClickable(true); // engole cliques para não fechar o painel
+
+        drawerAdapter = new DrawerAdapter();
+        startGrid = new GridView(this);
+        startGrid.setNumColumns(8);
+        startGrid.setStretchMode(GridView.STRETCH_COLUMN_WIDTH);
+        startGrid.setVerticalSpacing(dp(6));
+        startGrid.setSelector(new ColorDrawable(Color.TRANSPARENT));
+        startGrid.setAdapter(drawerAdapter);
+        startPanel.addView(startGrid, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        // Barra de pesquisa embaixo, como no DeX
+        LinearLayout sRow = row();
+        sRow.setBackground(roundRect(0x2EFFFFFF, dp(24)));
+        sRow.setPadding(dp(14), 0, dp(16), 0);
+        sRow.addView(new Glyph(this, Glyph.SEARCH), new LinearLayout.LayoutParams(dp(26), dp(26)));
 
         searchBox = new EditText(this);
-        searchBox.setHint("Pesquisar apps");
+        searchBox.setHint("Pesquisar");
         searchBox.setHintTextColor(0x99FFFFFF);
         searchBox.setTextColor(Color.WHITE);
-        searchBox.setTextSize(16);
+        searchBox.setTextSize(15);
         searchBox.setSingleLine(true);
-        searchBox.setImeOptions(EditorInfo.IME_ACTION_SEARCH);
-        searchBox.setBackground(roundRect(0x33FFFFFF, dp(24)));
-        searchBox.setPadding(dp(20), 0, dp(20), 0);
+        searchBox.setBackground(null);
+        searchBox.setPadding(dp(10), 0, dp(10), 0);
+        searchBox.setImeOptions(EditorInfo.IME_ACTION_SEARCH | EditorInfo.IME_FLAG_NO_EXTRACT_UI);
         searchBox.addTextChangedListener(new TextWatcher() {
             @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) { }
             @Override public void onTextChanged(CharSequence s, int a, int b, int c) { }
             @Override public void afterTextChanged(Editable s) { applyFilter(s.toString()); }
         });
         searchBox.setOnEditorActionListener((v, action, ev) -> { launchFirstResult(); return true; });
-        col.addView(searchBox, new LinearLayout.LayoutParams(dp(420), dp(46)));
+        sRow.addView(searchBox, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
 
-        drawerAdapter = new DrawerAdapter();
-        GridView grid = new GridView(this);
-        grid.setNumColumns(GridView.AUTO_FIT);
-        grid.setColumnWidth(dp(104));
-        grid.setStretchMode(GridView.STRETCH_COLUMN_WIDTH);
-        grid.setVerticalSpacing(dp(10));
-        grid.setSelector(new ColorDrawable(Color.TRANSPARENT));
-        grid.setAdapter(drawerAdapter);
-        LinearLayout.LayoutParams glp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f);
-        glp.topMargin = dp(24);
-        col.addView(grid, glp);
+        TextView verTxt = new TextView(this);
+        verTxt.setText("v" + VERSION);
+        verTxt.setTextColor(0x88FFFFFF);
+        verTxt.setTextSize(11);
+        sRow.addView(verTxt);
 
-        drawer.addView(col, new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(46));
+        slp.topMargin = dp(14);
+        startPanel.addView(sRow, slp);
+
+        FrameLayout.LayoutParams plp = new FrameLayout.LayoutParams(
+                dp(860), dp(600), Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
+        plp.bottomMargin = dp(12);
+        startScrim.addView(startPanel, plp);
+
         FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
         lp.bottomMargin = dp(BAR_H_DP);
-        rootFrame.addView(drawer, lp);
+        rootFrame.addView(startScrim, lp);
     }
 
     private void applyFilter(String q) {
         String n = norm(q.trim());
         filtered.clear();
         for (AppEntry e : allApps) if (n.isEmpty() || e.norm.contains(n)) filtered.add(e);
+        // Quem começa com o texto vem primeiro
+        if (!n.isEmpty()) {
+            final String fn = n;
+            Collections.sort(filtered, (a, b) -> {
+                boolean sa = a.norm.startsWith(fn), sb = b.norm.startsWith(fn);
+                if (sa != sb) return sa ? -1 : 1;
+                return a.label.toString().compareToIgnoreCase(b.label.toString());
+            });
+        }
         drawerAdapter.notifyDataSetChanged();
     }
 
     private void launchFirstResult() {
-        if (!filtered.isEmpty()) launch(filtered.get(0).pkg, cascadeBounds());
+        if (!filtered.isEmpty()) launchApp(filtered.get(0).pkg);
     }
 
-    private boolean drawerOpen() { return drawer.getVisibility() == View.VISIBLE; }
+    private boolean drawerOpen() { return startScrim.getVisibility() == View.VISIBLE; }
 
     private void toggleDrawer() { if (drawerOpen()) hideDrawer(); else showDrawer(); }
 
     private void showDrawer() {
         closeOverlays();
+        int w = rootFrame.getWidth() > 0 ? Math.min(dp(860), rootFrame.getWidth() - dp(48)) : dp(860);
+        int h = desktopArea.getHeight() > 0 ? Math.min(dp(600), desktopArea.getHeight() - dp(24)) : dp(600);
+        FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) startPanel.getLayoutParams();
+        lp.width = w;
+        lp.height = h;
+        startPanel.setLayoutParams(lp);
+        startGrid.setNumColumns(Math.max(3, (w - dp(44)) / dp(98)));
         searchBox.setText("");
         applyFilter("");
-        drawer.setVisibility(View.VISIBLE);
+        startScrim.setVisibility(View.VISIBLE);
         searchBox.setFocusableInTouchMode(true);
         searchBox.requestFocus();
     }
 
     private void hideDrawer() {
         if (!drawerOpen()) return;
-        drawer.setVisibility(View.GONE);
+        startScrim.setVisibility(View.GONE);
         searchBox.clearFocus();
         InputMethodManager imm = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
         if (imm != null) imm.hideSoftInputFromWindow(searchBox.getWindowToken(), 0);
@@ -622,14 +823,15 @@ public class MainActivity extends Activity {
         panel.setPadding(dp(12), dp(12), dp(12), dp(12));
         panel.setBackground(roundRect(0xF0161A24, dp(16)));
         for (String pkg : new ArrayList<>(running)) {
-            AppEntry e = find(pkg);
+            final String p = pkg;
+            AppEntry e = find(p);
             if (e == null) continue;
             LinearLayout card = new LinearLayout(this);
             card.setOrientation(LinearLayout.VERTICAL);
             card.setGravity(Gravity.CENTER_HORIZONTAL);
             card.setPadding(dp(14), dp(12), dp(14), dp(8));
             card.setBackground(roundRect(0x22FFFFFF, dp(12)));
-            card.setOnClickListener(v -> launch(pkg, null));
+            card.setOnClickListener(v -> launchApp(p));
             ImageView iv = new ImageView(this);
             iv.setImageDrawable(e.icon);
             card.addView(iv, new LinearLayout.LayoutParams(dp(48), dp(48)));
@@ -646,7 +848,7 @@ public class MainActivity extends Activity {
             close.setTextColor(0xFFFF8A80);
             close.setTextSize(11);
             close.setPadding(dp(8), dp(6), dp(8), dp(2));
-            close.setOnClickListener(v -> closeApp(pkg));
+            close.setOnClickListener(v -> closeApp(p));
             card.addView(close);
             LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
@@ -714,8 +916,12 @@ public class MainActivity extends Activity {
         int sc = i.getIntExtra(BatteryManager.EXTRA_SCALE, 100);
         if (lv < 0 || sc <= 0) return;
         int pct = lv * 100 / sc;
-        batteryText.setText(pct + "%");
-        batteryGlyph.setLevel(pct);
+        int st = i.getIntExtra(BatteryManager.EXTRA_STATUS, -1);
+        boolean charging = st == BatteryManager.BATTERY_STATUS_CHARGING
+                || st == BatteryManager.BATTERY_STATUS_FULL;
+        batteryBadge.setText(String.valueOf(pct));
+        batteryBadge.setBackground(roundRect(
+                charging ? 0xFFA5D6A7 : (pct <= 15 ? 0xFFFF8A80 : 0xFFFFFFFF), dp(13)));
     }
 
     private void updateNet() {
@@ -756,35 +962,40 @@ public class MainActivity extends Activity {
         return cell;
     }
 
-    private void refreshShortcuts() {
-        shortcutContainer.removeAllViews();
+    private void refreshDesktopIcons() {
+        iconFlow.removeAllViews();
+        int shown = 0;
         for (String pkg : shortcuts) {
-            AppEntry e = find(pkg);
+            final AppEntry e = find(pkg);
             if (e == null) continue;
+            shown++;
             View cell = makeIconCell(e);
-            cell.setOnClickListener(v -> launch(pkg, cascadeBounds()));
-            cell.setOnLongClickListener(v -> {
-                new AlertDialog.Builder(this)
-                        .setTitle(e.label)
-                        .setItems(new String[]{"Remover do desktop"}, (d, which) -> {
-                            shortcuts.remove(pkg);
-                            saveShortcuts();
-                            refreshShortcuts();
-                        }).show();
-                return true;
-            });
-            shortcutContainer.addView(cell);
+            cell.setOnClickListener(v -> launchApp(e.pkg));
+            cell.setOnLongClickListener(v -> { showAppMenu(e); return true; });
+            iconFlow.addView(cell);
         }
-        emptyHint.setVisibility(shortcuts.isEmpty() ? View.VISIBLE : View.GONE);
+        emptyHint.setVisibility(shown == 0 ? View.VISIBLE : View.GONE);
     }
 
     private void showDesktopMenu() {
         new AlertDialog.Builder(this)
-                .setItems(new String[]{"Papel de parede…", "Arquivos", "Todos os apps"}, (d, which) -> {
-                    if (which == 0) showWallpaperMenu();
-                    else if (which == 1) openFiles();
-                    else showDrawer();
-                }).show();
+                .setItems(new String[]{"Papel de parede…", "Arquivos", "Todos os apps", "Sobre / versão"},
+                        (d, which) -> {
+                            if (which == 0) showWallpaperMenu();
+                            else if (which == 1) openFiles();
+                            else if (which == 2) showDrawer();
+                            else showAbout();
+                        }).show();
+    }
+
+    private void showAbout() {
+        new AlertDialog.Builder(this)
+                .setTitle("Meu Dex v" + VERSION)
+                .setMessage("Launcher (APK) versão " + VERSION + "\n"
+                        + "Tela virtual: " + displayId() + "\n"
+                        + "Apps no desktop: " + shortcuts.size() + "  |  Fixados na barra: " + pinned.size())
+                .setPositiveButton("OK", null)
+                .show();
     }
 
     private void showWallpaperMenu() {
@@ -797,6 +1008,7 @@ public class MainActivity extends Activity {
                     if (which < PRESET_NAMES.length) {
                         prefs.edit().putString(KEY_WALL, "preset:" + which).apply();
                         applyWallpaper();
+                        logState();
                     } else {
                         Intent i = new Intent(Intent.ACTION_GET_CONTENT).setType("image/*");
                         try { startActivityForResult(i, REQ_WALL); }
@@ -874,38 +1086,65 @@ public class MainActivity extends Activity {
         }
     }
 
-    // ------------------------------------------------------------------ janelas
+    // ------------------------------------------------------------------ menus de app / janela
 
+    /** Menu de um app que NÃO está aberto (menu de apps, desktop, barra). */
+    private void showAppMenu(AppEntry e) {
+        final String pkg = e.pkg;
+        final List<String> labels = new ArrayList<>();
+        final List<Runnable> acts = new ArrayList<>();
+        labels.add("Abrir"); acts.add(() -> launchApp(pkg));
+        labels.add("Abrir em janela");
+        acts.add(() -> place(pkg, cascadeBounds(), MODE_WINDOW));
+        labels.add("Abrir maximizado");
+        acts.add(() -> place(pkg, areaBounds(0f, 1f), MODE_MAX));
+        labels.add("Abrir em tela cheia (jogos)");
+        acts.add(() -> place(pkg, null, MODE_FULL));
+        if (shortcuts.contains(pkg)) {
+            labels.add("Remover do desktop");
+            acts.add(() -> { shortcuts.remove(pkg); saveState(); refreshDesktopIcons(); });
+        } else {
+            labels.add("Adicionar ao desktop");
+            acts.add(() -> { shortcuts.add(pkg); saveState(); refreshDesktopIcons(); toast("Adicionado ao desktop"); });
+        }
+        labels.add(pinned.contains(pkg) ? "Desafixar da barra de tarefas" : "Fixar na barra de tarefas");
+        acts.add(() -> togglePin(pkg));
+        new AlertDialog.Builder(this)
+                .setTitle(e.label)
+                .setItems(labels.toArray(new String[0]), (d, which) -> acts.get(which).run())
+                .show();
+    }
+
+    /** Menu de uma janela aberta (segurar o ícone na barra). */
     private void showWindowMenu(AppEntry e) {
-        // Controles de janela (mesmos modos do DroidUP: normal, compacto, maximizado, painéis 1/2 e 1/3)
-        String[] items = {"Trazer para frente", "Tamanho normal", "Compacto (formato celular)", "Maximizar",
-                "Metade esquerda", "Metade direita", "1/3 esquerdo", "1/3 centro", "1/3 direito", "Fechar"};
+        final String pkg = e.pkg;
+        String[] items = {"Trazer para frente", "Janela (tamanho normal)", "Compacto (formato celular)",
+                "Maximizar", "Metade esquerda", "Metade direita", "Tela cheia (cobre a barra)",
+                pinned.contains(pkg) ? "Desafixar da barra" : "Fixar na barra", "Fechar"};
         new AlertDialog.Builder(this)
                 .setTitle(e.label)
                 .setItems(items, (d, which) -> {
                     switch (which) {
-                        case 0: launch(e.pkg, null); break;
-                        case 1: launch(e.pkg, centeredBounds(0.62f, 0.78f)); break;
-                        case 2: launch(e.pkg, centeredBounds(0.28f, 0.82f)); break;
-                        case 3: launch(e.pkg, areaBounds(0f, 1f)); break;
-                        case 4: launch(e.pkg, areaBounds(0f, 0.5f)); break;
-                        case 5: launch(e.pkg, areaBounds(0.5f, 1f)); break;
-                        case 6: launch(e.pkg, areaBounds(0f, 1f / 3f)); break;
-                        case 7: launch(e.pkg, areaBounds(1f / 3f, 2f / 3f)); break;
-                        case 8: launch(e.pkg, areaBounds(2f / 3f, 1f)); break;
-                        case 9: closeApp(e.pkg); break;
+                        case 0: launchApp(pkg); break;
+                        case 1: place(pkg, centeredBounds(0.62f, 0.78f), MODE_WINDOW); break;
+                        case 2: place(pkg, centeredBounds(0.28f, 0.82f), MODE_WINDOW); break;
+                        case 3: place(pkg, areaBounds(0f, 1f), MODE_MAX); break;
+                        case 4: place(pkg, areaBounds(0f, 0.5f), MODE_WINDOW); break;
+                        case 5: place(pkg, areaBounds(0.5f, 1f), MODE_WINDOW); break;
+                        case 6: place(pkg, null, MODE_FULL); break;
+                        case 7: togglePin(pkg); break;
+                        case 8: closeApp(pkg); break;
                     }
                 }).show();
     }
 
-    private void cycleWindows() {
-        if (running.isEmpty()) return;
-        int next = (running.indexOf(activePkg) + 1) % running.size();
-        lastLaunch = 0;
-        launch(running.get(next), null);
+    private void togglePin(String pkg) {
+        if (pinned.contains(pkg)) pinned.remove(pkg); else pinned.add(pkg);
+        saveState();
+        refreshTaskbar();
     }
 
-    // ------------------------------------------------------------------ lançamento
+    // ------------------------------------------------------------------ janelas e lançamento
 
     private int displayId() {
         if (android.os.Build.VERSION.SDK_INT >= 30) {
@@ -947,7 +1186,55 @@ public class MainActivity extends Activity {
         return new Rect(left, top, right, bottom);
     }
 
-    private void launch(String pkg, Rect bounds) {
+    private int modeOf(String pkg) {
+        Integer m = modes.get(pkg);
+        return m == null ? MODE_WINDOW : m;
+    }
+
+    /** Abrir com o modo lembrado. App já aberto: só traz a janela para frente (mantém tamanho e posição). */
+    private void launchApp(String pkg) {
+        boolean isRunning = running.contains(pkg);
+        int mode = modeOf(pkg);
+        Rect b = mode == MODE_MAX ? areaBounds(0f, 1f) : (mode == MODE_WINDOW ? cascadeBounds() : null);
+        open(pkg, isRunning ? null : b, mode, !isRunning);
+    }
+
+    /** Escolhe modo/tamanho (e lembra o modo). Vale para app aberto ou fechado. */
+    private void place(String pkg, Rect bounds, int mode) {
+        modes.put(pkg, mode);
+        saveState();
+        lastLaunch = 0;
+        open(pkg, bounds, mode, true);
+    }
+
+    private void cycleWindows() {
+        if (running.isEmpty()) return;
+        int next = (running.indexOf(activePkg) + 1) % running.size();
+        lastLaunch = 0;
+        launchApp(running.get(next));
+    }
+
+    /** "Mostrar desktop" = minimizar tudo: o launcher vai para frente, os apps continuam abertos. */
+    private void showDesktop() {
+        closeOverlays();
+        desktopShown = true;
+        refreshTaskbar();
+        bringLauncherToFront();
+    }
+
+    private void bringLauncherToFront() {
+        Intent i = new Intent(this, MainActivity.class);
+        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT);
+        ActivityOptions opts = ActivityOptions.makeBasic();
+        opts.setLaunchDisplayId(displayId());
+        try { startActivity(i, opts.toBundle()); } catch (Exception ignored) { }
+    }
+
+    /**
+     * apply=true  -> abre/recoloca a janela com bounds + modo de janela.
+     * apply=false -> só traz o app para frente.
+     */
+    private void open(String pkg, Rect bounds, int mode, boolean apply) {
         long now = SystemClock.elapsedRealtime();
         if (now - lastLaunch < LAUNCH_DEBOUNCE_MS) return;
         lastLaunch = now;
@@ -958,49 +1245,71 @@ public class MainActivity extends Activity {
             toast("Não foi possível abrir este app");
             return;
         }
-        // Primeira abertura: MULTIPLE_TASK cria uma tarefa NOVA nesta tela, em vez de puxar para cá
-        // a tarefa do mesmo app que esteja aberta no celular (mantém celular e desktop separados).
+        // Primeira abertura: MULTIPLE_TASK cria uma tarefa NOVA nesta tela (mantém celular e desktop separados).
         // Configurações do sistema ficam com tela preta na tela virtual: abre no celular (como o DroidUP).
         boolean onPhone = pkg.equals("com.android.settings");
         boolean first = !running.contains(pkg);
         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
                 | (first && !onPhone ? Intent.FLAG_ACTIVITY_MULTIPLE_TASK : 0));
-
-        ActivityOptions opts = ActivityOptions.makeBasic();
-        opts.setLaunchDisplayId(onPhone ? 0 : displayId());
-        if (bounds != null && !onPhone) opts.setLaunchBounds(bounds);
         if (onPhone) toast("Configurações abrem na tela do celular");
 
-        try {
-            startActivity(intent, opts.toBundle());
-            if (onPhone) return;
-            if (first) running.add(pkg);
-            activePkg = pkg;
-            refreshTaskbar();
-        } catch (Exception ex) {
-            toast("Falha ao abrir: " + ex.getMessage());
+        int wm = 0;
+        if (apply && !onPhone) wm = (mode == MODE_FULL) ? WM_FULLSCREEN : WM_FREEFORM;
+        boolean ok = tryStart(intent, onPhone ? 0 : displayId(),
+                (apply && !onPhone && mode != MODE_FULL) ? bounds : null, wm);
+        if (!ok || onPhone) return;
+
+        if (first) running.add(pkg);
+        activePkg = pkg;
+        desktopShown = false;
+        refreshTaskbar();
+        if (apply) logFit(pkg, bounds, mode);
+    }
+
+    private boolean tryStart(Intent intent, int display, Rect bounds, int windowingMode) {
+        for (int attempt = 0; attempt < 2; attempt++) {
+            try {
+                ActivityOptions o = ActivityOptions.makeBasic();
+                o.setLaunchDisplayId(display);
+                if (bounds != null) o.setLaunchBounds(bounds);
+                // Na 1ª tentativa também pede o modo de janela (API oculta; se o sistema recusar, tenta sem).
+                if (attempt == 0 && windowingMode != 0) setWindowingMode(o, windowingMode);
+                startActivity(intent, o.toBundle());
+                return true;
+            } catch (Exception ex) {
+                if (attempt == 1) toast("Falha ao abrir: " + ex.getMessage());
+            }
         }
+        return false;
     }
 
-    private void bringLauncherToFront() {
-        Intent i = new Intent(this, MainActivity.class);
-        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT);
-        ActivityOptions opts = ActivityOptions.makeBasic();
-        opts.setLaunchDisplayId(displayId());
-        startActivity(i, opts.toBundle());
+    private static void setWindowingMode(ActivityOptions o, int mode) {
+        try {
+            ActivityOptions.class.getMethod("setLaunchWindowingMode", int.class).invoke(o, mode);
+        } catch (Throwable ignored) { /* API oculta: o PC reforça o modo depois (cmd=fit) */ }
     }
 
-    /** killBackgroundProcesses só mata apps em segundo plano: primeiro o launcher vai para frente. */
+    /** Avisa o PC: confira se a janela está no modo certo e ajuste o tamanho (am task resize). */
+    private void logFit(String pkg, Rect b, int mode) {
+        Rect r = b != null ? b : new Rect(0, 0, 0, 0);
+        Log.i(TAG, "cmd=fit pkg=" + pkg + " b=" + r.left + "," + r.top + "," + r.right + "," + r.bottom
+                + " mode=" + mode + " display=" + displayId());
+    }
+
+    /** O PC faz o force-stop (é o único jeito de fechar um app que está em primeiro plano). */
     private void closeApp(String pkg) {
         closeOverlays();
-        bringLauncherToFront();
+        Log.i(TAG, "cmd=close pkg=" + pkg + " display=" + displayId());
+        running.remove(pkg);
+        if (pkg.equals(activePkg)) activePkg = null;
+        refreshTaskbar();
+        // Plano B sem PC: encerra se o app estiver em segundo plano.
         handler.postDelayed(() -> {
-            ActivityManager am = (ActivityManager) getSystemService(Context.ACTIVITY_SERVICE);
-            am.killBackgroundProcesses(pkg);
-            running.remove(pkg);
-            if (pkg.equals(activePkg)) activePkg = null;
-            refreshTaskbar();
-        }, 450);
+            try {
+                ActivityManager am = (ActivityManager) getSystemService(Context.ACTIVITY_SERVICE);
+                am.killBackgroundProcesses(pkg);
+            } catch (Exception ignored) { }
+        }, 1500);
     }
 
     // ------------------------------------------------------------------ helpers
@@ -1029,32 +1338,23 @@ public class MainActivity extends Activity {
 
         @Override
         public View getView(int position, View convertView, ViewGroup parent) {
-            AppEntry e = filtered.get(position);
+            final AppEntry e = filtered.get(position);
             View cell = makeIconCell(e);
-            cell.setOnClickListener(v -> launch(e.pkg, cascadeBounds()));
-            cell.setOnLongClickListener(v -> {
-                if (shortcuts.contains(e.pkg)) {
-                    toast("Já está no desktop");
-                } else {
-                    shortcuts.add(e.pkg);
-                    saveShortcuts();
-                    refreshShortcuts();
-                    toast("Adicionado ao desktop: " + e.label);
-                }
-                return true;
-            });
+            cell.setOnClickListener(v -> launchApp(e.pkg));
+            cell.setOnLongClickListener(v -> { showAppMenu(e); return true; });
             return cell;
         }
     }
 
-    /** Ícones do desktop fluem de cima para baixo e quebram para a próxima coluna. */
-    private static class ColumnFlow extends ViewGroup {
-        private final int cellW, cellH;
+    /** Ícones do desktop: fileira centralizada embaixo (como o DeX); se não couber, sobe para a próxima fileira. */
+    private static class BottomFlow extends ViewGroup {
+        private final int cellW, cellH, margin;
 
-        ColumnFlow(Context c, int cellW, int cellH) {
+        BottomFlow(Context c, int cellW, int cellH, int margin) {
             super(c);
             this.cellW = cellW;
             this.cellH = cellH;
+            this.margin = margin;
         }
 
         @Override
@@ -1069,10 +1369,16 @@ public class MainActivity extends Activity {
 
         @Override
         protected void onLayout(boolean changed, int l, int t, int r, int b) {
-            int perColumn = Math.max(1, (b - t) / cellH);
-            for (int i = 0; i < getChildCount(); i++) {
-                int col = i / perColumn, row = i % perColumn;
-                getChildAt(i).layout(col * cellW, row * cellH, (col + 1) * cellW, (row + 1) * cellH);
+            int w = r - l, h = b - t;
+            int perRow = Math.max(1, w / cellW);
+            int n = getChildCount();
+            for (int i = 0; i < n; i++) {
+                int row = i / perRow, col = i % perRow;
+                int inRow = Math.min(perRow, n - row * perRow);
+                int x0 = (w - inRow * cellW) / 2;
+                int left = x0 + col * cellW;
+                int top = Math.max(0, h - margin - (row + 1) * cellH);
+                getChildAt(i).layout(left, top, left + cellW, top + cellH);
             }
         }
     }
@@ -1080,12 +1386,11 @@ public class MainActivity extends Activity {
     /** Ícones de linha brancos desenhados à mão (estilo barra do DeX). */
     private static class Glyph extends View {
         static final int GRID = 0, SEARCH = 1, RECENTS = 2, HOME = 3, BACK = 4,
-                VOLUME = 5, WIFI = 6, BATTERY = 7;
+                VOLUME = 5, WIFI = 6;
         private final int type;
         private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final RectF r = new RectF();
         private final Path path = new Path();
-        private int level = 100;
         private boolean dim = false;
 
         Glyph(Context c, int type) {
@@ -1094,8 +1399,6 @@ public class MainActivity extends Activity {
             p.setStrokeCap(Paint.Cap.ROUND);
             p.setStrokeJoin(Paint.Join.ROUND);
         }
-
-        void setLevel(int l) { level = Math.max(0, Math.min(100, l)); invalidate(); }
 
         void setDim(boolean d) { dim = d; invalidate(); }
 
@@ -1162,17 +1465,6 @@ public class MainActivity extends Activity {
                     }
                     p.setStyle(Paint.Style.FILL);
                     c.drawCircle(cx, cy + 5f * u, 1.6f * u, p);
-                    break;
-                case BATTERY:
-                    p.setStyle(Paint.Style.STROKE);
-                    p.setStrokeWidth(1.4f * u);
-                    r.set(cx - 9f * u, cy - 4.5f * u, cx + 8f * u, cy + 4.5f * u);
-                    c.drawRoundRect(r, 2f * u, 2f * u, p);
-                    p.setStyle(Paint.Style.FILL);
-                    c.drawRect(cx + 8.8f * u, cy - 2f * u, cx + 10.2f * u, cy + 2f * u, p);
-                    float fill = (r.width() - 4f * u) * level / 100f;
-                    if (fill > 0)
-                        c.drawRect(r.left + 2f * u, cy - 2.5f * u, r.left + 2f * u + fill, cy + 2.5f * u, p);
                     break;
             }
         }
