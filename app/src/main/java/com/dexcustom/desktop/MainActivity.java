@@ -20,6 +20,7 @@ import android.graphics.Path;
 import android.graphics.Rect;
 import android.graphics.RectF;
 import android.graphics.Typeface;
+import android.graphics.drawable.BitmapDrawable;
 import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
@@ -64,9 +65,20 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.regex.Pattern;
 
 /**
- * Meu Dex v0.3 - launcher estilo Samsung DeX para a tela virtual do scrcpy.
+ * Meu Dex v0.4 - launcher estilo Samsung DeX para a tela virtual do scrcpy.
+ *
+ * Novidades da v0.4 (desempenho + janelas):
+ *  - Abertura bem mais rapida: os icones sao carregados em segundo plano (uma thread) e guardados como
+ *    bitmaps pequenos; antes todos eram carregados na thread da interface antes de mostrar a tela.
+ *  - Menu de apps fluido: a grade reaproveita as views (convertView); antes criava uma view nova por rolagem.
+ *  - Regex pre-compilados; menos alocacoes. Avisa o PC da area util do desktop (linha "area ...").
+ *  - Menu de janela maior: metades, quartos, centralizar, grande e "Tamanho personalizado...".
+ *  - Launcher nao e mais redimensionavel (como o DroidUP): nunca vira uma janelinha na tela virtual.
  *
  * Novidades da v0.3:
  *  - Barra de tarefas no layout do DeX: navegacao (recentes/inicio/voltar) a esquerda, busca + apps + favoritos
@@ -84,7 +96,7 @@ import java.util.Map;
  */
 public class MainActivity extends Activity {
 
-    static final String VERSION = "0.3";
+    static final String VERSION = "0.4";
 
     private static final String TAG = "MeuDex";
     private static final String PREFS = "meudex_prefs";
@@ -114,8 +126,17 @@ public class MainActivity extends Activity {
         String pkg;
         CharSequence label;
         String norm;
-        Drawable icon;
+        ResolveInfo ri;
+        volatile Drawable icon;   // carregado em segundo plano (null = ainda nao carregou)
     }
+
+    private static final Pattern PKG_PATTERN = Pattern.compile("[A-Za-z0-9._]+");
+    private static final Pattern DIACRITICS = Pattern.compile("\\p{M}");
+    private static final Pattern WALL_PATTERN = Pattern.compile("[A-Za-z0-9:_]+");
+    private static final Drawable PLACEHOLDER = new ColorDrawable(0x22FFFFFF);
+    private final ExecutorService bg = Executors.newSingleThreadExecutor();
+    private volatile boolean destroyed = false;
+    private String lastArea = "";
 
     private PackageManager pm;
     private SharedPreferences prefs;
@@ -168,6 +189,8 @@ public class MainActivity extends Activity {
         registerStatus();
         // O PC le esta linha: id da tela virtual + versao do launcher instalado.
         Log.i(TAG, "ready display=" + displayId() + " version=" + VERSION);
+        desktopArea.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> logArea());
+        preloadIcons();
         handleCommand(getIntent());
     }
 
@@ -181,6 +204,9 @@ public class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         super.onDestroy();
+        destroyed = true;
+        bg.shutdownNow();
+        handler.removeCallbacksAndMessages(null);
         try { unregisterReceiver(batteryRcv); } catch (Exception ignored) { }
         try { if (cm != null && netCb != null) cm.unregisterNetworkCallback(netCb); } catch (Exception ignored) { }
     }
@@ -261,12 +287,11 @@ public class MainActivity extends Activity {
     // ------------------------------------------------------------------ dados
 
     private static String norm(CharSequence s) {
-        return Normalizer.normalize(s, Normalizer.Form.NFD)
-                .replaceAll("\\p{M}", "").toLowerCase();
+        return DIACRITICS.matcher(Normalizer.normalize(s, Normalizer.Form.NFD)).replaceAll("").toLowerCase();
     }
 
     private static boolean safePkg(String p) {
-        return p.matches("[A-Za-z0-9._]+");
+        return PKG_PATTERN.matcher(p).matches();
     }
 
     private void loadApps() {
@@ -279,11 +304,66 @@ public class MainActivity extends Activity {
             e.pkg = pkg;
             e.label = ri.loadLabel(pm);
             e.norm = norm(e.label);
-            e.icon = ri.loadIcon(pm);
+            e.ri = ri;
             allApps.add(e);
         }
         Collections.sort(allApps, (a, b) ->
                 a.label.toString().compareToIgnoreCase(b.label.toString()));
+    }
+
+    private Drawable iconOf(AppEntry e) {
+        Drawable d = e.icon;
+        return d != null ? d : PLACEHOLDER;
+    }
+
+    private Drawable toBitmapIcon(Drawable d, int px) {
+        Bitmap b = Bitmap.createBitmap(px, px, Bitmap.Config.ARGB_8888);
+        Canvas c = new Canvas(b);
+        d.setBounds(0, 0, px, px);
+        d.draw(c);
+        return new BitmapDrawable(getResources(), b);
+    }
+
+    /** Carrega os icones fora da thread da interface: primeiro desktop e barra, depois o resto. */
+    private void preloadIcons() {
+        final List<AppEntry> order = new ArrayList<>();
+        for (String p : shortcuts) { AppEntry e = find(p); if (e != null && !order.contains(e)) order.add(e); }
+        for (String p : pinned) { AppEntry e = find(p); if (e != null && !order.contains(e)) order.add(e); }
+        final int first = order.size();
+        for (AppEntry e : allApps) if (!order.contains(e)) order.add(e);
+        final int total = order.size();
+        bg.execute(() -> {
+            int n = 0;
+            for (AppEntry e : order) {
+                if (destroyed) return;
+                if (e.icon == null && e.ri != null) {
+                    try { e.icon = toBitmapIcon(e.ri.loadIcon(pm), 128); }
+                    catch (Throwable ignored) { }
+                }
+                n++;
+                if (n == first || n % 40 == 0 || n == total) handler.post(this::onIconsLoaded);
+            }
+        });
+    }
+
+    private void onIconsLoaded() {
+        if (destroyed) return;
+        drawerAdapter.notifyDataSetChanged();
+        refreshDesktopIcons();
+        refreshTaskbar();
+    }
+
+    /** Avisa o PC da area util (acima da barra) para ele limitar mover/redimensionar janelas. */
+    private void logArea() {
+        if (desktopArea == null || desktopArea.getWidth() == 0) return;
+        int[] loc = new int[2];
+        desktopArea.getLocationOnScreen(loc);
+        String a = "area display=" + displayId() + " b=" + loc[0] + "," + loc[1] + ","
+                + (loc[0] + desktopArea.getWidth()) + "," + (loc[1] + desktopArea.getHeight())
+                + " size=" + rootFrame.getWidth() + "x" + rootFrame.getHeight();
+        if (a.equals(lastArea)) return;
+        lastArea = a;
+        Log.i(TAG, a);
     }
 
     private AppEntry find(String pkg) {
@@ -329,7 +409,7 @@ public class MainActivity extends Activity {
     /** Formato simples (só caracteres seguros para o shell do adb): d=a,b@p=c@m=x:1@w=preset:0 */
     private String encodeState() {
         String w = prefs.getString(KEY_WALL, "preset:0");
-        if (!w.matches("[A-Za-z0-9:_]+")) w = "preset:0";
+        if (!WALL_PATTERN.matcher(w).matches()) w = "preset:0";
         return "d=" + TextUtils.join(",", shortcuts) + "@p=" + TextUtils.join(",", pinned)
                 + "@m=" + modesCsv() + "@w=" + w;
     }
@@ -564,7 +644,7 @@ public class MainActivity extends Activity {
             slot.addView(ind, new LinearLayout.LayoutParams(dp(act ? 16 : 6), dp(3)));
 
             ImageView iv = new ImageView(this);
-            iv.setImageDrawable(e.icon);
+            iv.setImageDrawable(iconOf(e));
             iv.setPadding(dp(3), dp(3), dp(3), dp(3));
             LinearLayout.LayoutParams ilp = new LinearLayout.LayoutParams(dp(36), dp(36));
             ilp.topMargin = dp(3);
@@ -634,7 +714,7 @@ public class MainActivity extends Activity {
 
         LinearLayout head = row();
         ImageView ic = new ImageView(this);
-        ic.setImageDrawable(e.icon);
+        ic.setImageDrawable(iconOf(e));
         head.addView(ic, new LinearLayout.LayoutParams(dp(18), dp(18)));
         TextView t = new TextView(this);
         t.setText(e.label);
@@ -659,7 +739,7 @@ public class MainActivity extends Activity {
         FrameLayout prev = new FrameLayout(this);
         prev.setBackground(roundRect(0xFF0E1118, dp(8)));
         ImageView big = new ImageView(this);
-        big.setImageDrawable(e.icon);
+        big.setImageDrawable(iconOf(e));
         prev.addView(big, new FrameLayout.LayoutParams(dp(56), dp(56), Gravity.CENTER));
         LinearLayout.LayoutParams plp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, dp(110));
@@ -833,7 +913,7 @@ public class MainActivity extends Activity {
             card.setBackground(roundRect(0x22FFFFFF, dp(12)));
             card.setOnClickListener(v -> launchApp(p));
             ImageView iv = new ImageView(this);
-            iv.setImageDrawable(e.icon);
+            iv.setImageDrawable(iconOf(e));
             card.addView(iv, new LinearLayout.LayoutParams(dp(48), dp(48)));
             TextView tv = new TextView(this);
             tv.setText(e.label);
@@ -938,7 +1018,7 @@ public class MainActivity extends Activity {
 
     // ------------------------------------------------------------------ desktop: ícones, papel de parede, arquivos
 
-    private View makeIconCell(AppEntry e) {
+    private View makeIconCellEmpty() {
         LinearLayout cell = new LinearLayout(this);
         cell.setOrientation(LinearLayout.VERTICAL);
         cell.setGravity(Gravity.CENTER_HORIZONTAL);
@@ -946,11 +1026,9 @@ public class MainActivity extends Activity {
         hoverBg(cell, 0x22FFFFFF, dp(10));
 
         ImageView iv = new ImageView(this);
-        iv.setImageDrawable(e.icon);
         cell.addView(iv, new LinearLayout.LayoutParams(dp(52), dp(52)));
 
         TextView tv = new TextView(this);
-        tv.setText(e.label);
         tv.setTextColor(Color.WHITE);
         tv.setTextSize(12);
         tv.setMaxLines(2);
@@ -959,6 +1037,19 @@ public class MainActivity extends Activity {
         tv.setShadowLayer(4f, 0f, 1f, Color.BLACK);
         cell.addView(tv, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        cell.setTag(new View[]{iv, tv});
+        return cell;
+    }
+
+    private void bindIconCell(View cell, AppEntry e) {
+        View[] h = (View[]) cell.getTag();
+        ((ImageView) h[0]).setImageDrawable(iconOf(e));
+        ((TextView) h[1]).setText(e.label);
+    }
+
+    private View makeIconCell(AppEntry e) {
+        View cell = makeIconCellEmpty();
+        bindIconCell(cell, e);
         return cell;
     }
 
@@ -1118,8 +1209,10 @@ public class MainActivity extends Activity {
     /** Menu de uma janela aberta (segurar o ícone na barra). */
     private void showWindowMenu(AppEntry e) {
         final String pkg = e.pkg;
-        String[] items = {"Trazer para frente", "Janela (tamanho normal)", "Compacto (formato celular)",
-                "Maximizar", "Metade esquerda", "Metade direita", "Tela cheia (cobre a barra)",
+        String[] items = {"Trazer para frente", "Janela (tamanho normal)", "Grande (85%)", "Compacto (formato celular)",
+                "Maximizar", "Metade esquerda", "Metade direita", "Metade de cima", "Metade de baixo",
+                "Quarto superior esquerdo", "Quarto superior direito", "Quarto inferior esquerdo", "Quarto inferior direito",
+                "Centralizar", "Tamanho personalizado…", "Tela cheia (cobre a barra)",
                 pinned.contains(pkg) ? "Desafixar da barra" : "Fixar na barra", "Fechar"};
         new AlertDialog.Builder(this)
                 .setTitle(e.label)
@@ -1127,15 +1220,57 @@ public class MainActivity extends Activity {
                     switch (which) {
                         case 0: launchApp(pkg); break;
                         case 1: place(pkg, centeredBounds(0.62f, 0.78f), MODE_WINDOW); break;
-                        case 2: place(pkg, centeredBounds(0.28f, 0.82f), MODE_WINDOW); break;
-                        case 3: place(pkg, areaBounds(0f, 1f), MODE_MAX); break;
-                        case 4: place(pkg, areaBounds(0f, 0.5f), MODE_WINDOW); break;
-                        case 5: place(pkg, areaBounds(0.5f, 1f), MODE_WINDOW); break;
-                        case 6: place(pkg, null, MODE_FULL); break;
-                        case 7: togglePin(pkg); break;
-                        case 8: closeApp(pkg); break;
+                        case 2: place(pkg, centeredBounds(0.85f, 0.88f), MODE_WINDOW); break;
+                        case 3: place(pkg, centeredBounds(0.28f, 0.82f), MODE_WINDOW); break;
+                        case 4: place(pkg, areaBounds(0f, 1f), MODE_MAX); break;
+                        case 5: place(pkg, areaFrac(0f, 0f, 0.5f, 1f), MODE_WINDOW); break;
+                        case 6: place(pkg, areaFrac(0.5f, 0f, 1f, 1f), MODE_WINDOW); break;
+                        case 7: place(pkg, areaFrac(0f, 0f, 1f, 0.5f), MODE_WINDOW); break;
+                        case 8: place(pkg, areaFrac(0f, 0.5f, 1f, 1f), MODE_WINDOW); break;
+                        case 9: place(pkg, areaFrac(0f, 0f, 0.5f, 0.5f), MODE_WINDOW); break;
+                        case 10: place(pkg, areaFrac(0.5f, 0f, 1f, 0.5f), MODE_WINDOW); break;
+                        case 11: place(pkg, areaFrac(0f, 0.5f, 0.5f, 1f), MODE_WINDOW); break;
+                        case 12: place(pkg, areaFrac(0.5f, 0.5f, 1f, 1f), MODE_WINDOW); break;
+                        case 13: place(pkg, centeredBounds(0.62f, 0.78f), MODE_WINDOW); break;
+                        case 14: showCustomSize(e); break;
+                        case 15: place(pkg, null, MODE_FULL); break;
+                        case 16: togglePin(pkg); break;
+                        case 17: closeApp(pkg); break;
                     }
                 }).show();
+    }
+
+    /** Dialogo com duas barras (largura e altura em % da area util) para o tamanho que voce quiser. */
+    private void showCustomSize(AppEntry e) {
+        final String pkg = e.pkg;
+        final int[] pct = {60, 75};
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(24), dp(12), dp(24), dp(4));
+        final TextView wl = new TextView(this), hl = new TextView(this);
+        SeekBar ws = new SeekBar(this), hs = new SeekBar(this);
+        ws.setMax(80); hs.setMax(80);              // 20%..100%
+        ws.setProgress(pct[0] - 20); hs.setProgress(pct[1] - 20);
+        wl.setText("Largura: " + pct[0] + "%");
+        hl.setText("Altura: " + pct[1] + "%");
+        ws.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override public void onProgressChanged(SeekBar sb, int p, boolean u) { pct[0] = p + 20; wl.setText("Largura: " + pct[0] + "%"); }
+            @Override public void onStartTrackingTouch(SeekBar sb) { }
+            @Override public void onStopTrackingTouch(SeekBar sb) { }
+        });
+        hs.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override public void onProgressChanged(SeekBar sb, int p, boolean u) { pct[1] = p + 20; hl.setText("Altura: " + pct[1] + "%"); }
+            @Override public void onStartTrackingTouch(SeekBar sb) { }
+            @Override public void onStopTrackingTouch(SeekBar sb) { }
+        });
+        box.addView(wl); box.addView(ws); box.addView(hl); box.addView(hs);
+        new AlertDialog.Builder(this)
+                .setTitle(e.label + " - tamanho")
+                .setView(box)
+                .setPositiveButton("Aplicar", (d, w) ->
+                        place(pkg, centeredBounds(pct[0] / 100f, pct[1] / 100f), MODE_WINDOW))
+                .setNegativeButton("Cancelar", null)
+                .show();
     }
 
     private void togglePin(String pkg) {
@@ -1159,10 +1294,16 @@ public class MainActivity extends Activity {
     }
 
     private Rect areaBounds(float from, float to) {
+        return areaFrac(from, 0f, to, 1f);
+    }
+
+    /** Retangulo dentro da area util (acima da barra) em fracoes 0..1. */
+    private Rect areaFrac(float l, float t, float r, float b) {
         int[] loc = new int[2];
         desktopArea.getLocationOnScreen(loc);
         int w = desktopArea.getWidth(), h = desktopArea.getHeight();
-        return new Rect(loc[0] + (int) (w * from), loc[1], loc[0] + (int) (w * to), loc[1] + h);
+        return new Rect(loc[0] + (int) (w * l), loc[1] + (int) (h * t),
+                loc[0] + (int) (w * r), loc[1] + (int) (h * b));
     }
 
     private Rect centeredBounds(float fw, float fh) {
@@ -1339,7 +1480,8 @@ public class MainActivity extends Activity {
         @Override
         public View getView(int position, View convertView, ViewGroup parent) {
             final AppEntry e = filtered.get(position);
-            View cell = makeIconCell(e);
+            View cell = convertView != null ? convertView : makeIconCellEmpty();
+            bindIconCell(cell, e);
             cell.setOnClickListener(v -> launchApp(e.pkg));
             cell.setOnLongClickListener(v -> { showAppMenu(e); return true; });
             return cell;
