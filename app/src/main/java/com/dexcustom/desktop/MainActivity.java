@@ -96,7 +96,7 @@ import java.util.regex.Pattern;
  */
 public class MainActivity extends Activity {
 
-    static final String VERSION = "0.4";
+    static final String VERSION = "0.5.1";
 
     private static final String TAG = "MeuDex";
     private static final String PREFS = "meudex_prefs";
@@ -104,6 +104,8 @@ public class MainActivity extends Activity {
     private static final String KEY_PINNED = "pinned";
     private static final String KEY_MODES = "modes";
     private static final String KEY_WALL = "wallpaper";
+    private static final String KEY_POS = "iconpos";     // posição (coluna:linha) dos ícones do desktop
+    private static final String KEY_FREE = "iconfree";   // true = pode arrastar os ícones
     private static final long LAUNCH_DEBOUNCE_MS = 300;
     private static final int BAR_H_DP = 52;
     private static final int REQ_WALL = 77;
@@ -148,11 +150,15 @@ public class MainActivity extends Activity {
     private final List<String> running = new ArrayList<>();
     private String activePkg;
     private boolean desktopShown = false;
+    private boolean phoneMode = false;   // aberto na tela do celular (não na tela virtual): só mostra um aviso, não executa nada
 
     private FrameLayout rootFrame, desktopArea, startScrim;
     private LinearLayout startPanel;
     private ImageView wallpaperImage;
-    private BottomFlow iconFlow;
+    private IconGrid iconFlow;
+    private final List<String> gridPkgs = new ArrayList<>();      // app de cada ícone do desktop (mesma ordem da grade)
+    private final Map<String, int[]> iconPos = new HashMap<>();   // pkg -> {coluna, linha}
+    private boolean iconsFree = true;
     private LinearLayout taskbarStrip;
     private TextView emptyHint, batteryBadge;
     private Glyph wifiGlyph;
@@ -180,6 +186,13 @@ public class MainActivity extends Activity {
         super.onCreate(savedInstanceState);
         pm = getPackageManager();
         prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+        // Na tela do celular (display 0) o launcher NÃO deve rodar: tela cheia escura, comandos indo para o celular e,
+        // principalmente, avisar o PC "display=0" faria o PC mexer nas janelas do celular.
+        if (displayId() == 0) {
+            phoneMode = true;
+            setContentView(buildPhoneNotice());
+            return;
+        }
         loadApps();
         loadState();
         setContentView(buildUi());
@@ -191,14 +204,45 @@ public class MainActivity extends Activity {
         Log.i(TAG, "ready display=" + displayId() + " version=" + VERSION);
         desktopArea.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> logArea());
         preloadIcons();
+        logLabels();
         handleCommand(getIntent());
     }
 
     @Override
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
+        if (phoneMode) return;
         setIntent(intent);
         handleCommand(intent);
+    }
+
+    /** Aviso simples para quando o app é aberto no celular. Sai sozinho ao ir para segundo plano (não fica tarefa parada). */
+    private View buildPhoneNotice() {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setGravity(Gravity.CENTER);
+        box.setPadding(dp(32), dp(32), dp(32), dp(32));
+        box.setBackgroundColor(0xFF101418);
+        TextView t = new TextView(this);
+        t.setText("Meu Dex roda na tela virtual do PC.\n\nAbra o programa do PC e clique em INICIAR.\nNada é executado no celular.");
+        t.setTextColor(Color.WHITE);
+        t.setTextSize(15);
+        t.setGravity(Gravity.CENTER);
+        box.addView(t);
+        android.widget.Button b = new android.widget.Button(this);
+        b.setText("Fechar");
+        b.setOnClickListener(v -> finish());
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.topMargin = dp(24);
+        box.addView(b, lp);
+        return box;
+    }
+
+    @Override
+    protected void onStop() {
+        super.onStop();
+        if (phoneMode) finish();
     }
 
     @Override
@@ -214,7 +258,7 @@ public class MainActivity extends Activity {
     @Override
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
-        if (hasFocus) enterFullscreen();
+        if (hasFocus && !phoneMode) enterFullscreen();
     }
 
     @SuppressWarnings("deprecation")
@@ -230,6 +274,7 @@ public class MainActivity extends Activity {
 
     @Override
     public void onBackPressed() {
+        if (phoneMode) { finish(); return; }
         if (anyOverlayOpen()) closeOverlays();
     }
 
@@ -245,6 +290,7 @@ public class MainActivity extends Activity {
             switch (cmd) {
                 case "start": toggleDrawer(); break;
                 case "cycle": cycleWindows(); break;
+                case "front": if (data != null && safePkg(data)) { lastLaunch = 0; launchApp(data); } break;
                 case "home": showDesktop(); break;
                 case "closeactive": if (activePkg != null) closeApp(activePkg); break;
                 case "import": if (data != null) importState(data); break;
@@ -256,6 +302,7 @@ public class MainActivity extends Activity {
     /** Win abre o Iniciar; Alt+Tab troca de janela; Esc fecha painéis; digitar já pesquisa apps. */
     @Override
     public boolean dispatchKeyEvent(KeyEvent e) {
+        if (phoneMode) return super.dispatchKeyEvent(e);
         int k = e.getKeyCode();
         if (k == KeyEvent.KEYCODE_META_LEFT || k == KeyEvent.KEYCODE_META_RIGHT) {
             if (e.getAction() == KeyEvent.ACTION_UP) toggleDrawer();
@@ -354,6 +401,17 @@ public class MainActivity extends Activity {
     }
 
     /** Avisa o PC da area util (acima da barra) para ele limitar mover/redimensionar janelas. */
+    /** Manda ao PC o nome de cada app (o Alt+Tab do PC mostra o nome, não o pacote). Feito fora da thread da interface. */
+    private void logLabels() {
+        final List<AppEntry> copy = new ArrayList<>(allApps);
+        bg.execute(() -> {
+            for (AppEntry e : copy) {
+                if (destroyed) return;
+                Log.i(TAG, "label pkg=" + e.pkg + " text=" + Uri.encode(String.valueOf(e.label)));
+            }
+        });
+    }
+
     private void logArea() {
         if (desktopArea == null || desktopArea.getWidth() == 0) return;
         int[] loc = new int[2];
@@ -400,7 +458,28 @@ public class MainActivity extends Activity {
         return TextUtils.join(",", parts);
     }
 
+    private void fillPos(String csv) {
+        iconPos.clear();
+        for (String s : csv.split(",")) {
+            String[] a = s.split(":");
+            if (a.length != 3 || !safePkg(a[0])) continue;
+            try { iconPos.put(a[0], new int[]{Math.max(0, Integer.parseInt(a[1])), Math.max(0, Integer.parseInt(a[2]))}); }
+            catch (NumberFormatException ignored) { }
+        }
+    }
+
+    private String posCsv() {
+        List<String> parts = new ArrayList<>();
+        for (String pkg : shortcuts) {
+            int[] c = iconPos.get(pkg);
+            if (c != null) parts.add(pkg + ":" + c[0] + ":" + c[1]);
+        }
+        return TextUtils.join(",", parts);
+    }
+
     private void loadState() {
+        iconsFree = prefs.getBoolean(KEY_FREE, true);
+        fillPos(prefs.getString(KEY_POS, ""));
         fillList(shortcuts, prefs.getString(KEY_SHORTCUTS, ""));
         fillList(pinned, prefs.getString(KEY_PINNED, ""));
         fillModes(prefs.getString(KEY_MODES, ""));
@@ -411,7 +490,7 @@ public class MainActivity extends Activity {
         String w = prefs.getString(KEY_WALL, "preset:0");
         if (!WALL_PATTERN.matcher(w).matches()) w = "preset:0";
         return "d=" + TextUtils.join(",", shortcuts) + "@p=" + TextUtils.join(",", pinned)
-                + "@m=" + modesCsv() + "@w=" + w;
+                + "@m=" + modesCsv() + "@w=" + w + "@i=" + posCsv();
     }
 
     private void logState() {
@@ -423,6 +502,7 @@ public class MainActivity extends Activity {
                 .putString(KEY_SHORTCUTS, TextUtils.join(",", shortcuts))
                 .putString(KEY_PINNED, TextUtils.join(",", pinned))
                 .putString(KEY_MODES, modesCsv())
+                .putString(KEY_POS, posCsv())
                 .apply();
         logState(); // o PC guarda uma cópia em meudex_apps.json
     }
@@ -437,6 +517,7 @@ public class MainActivity extends Activity {
                 case "d": fillList(shortcuts, v); break;
                 case "p": fillList(pinned, v); break;
                 case "m": fillModes(v); break;
+                case "i": fillPos(v); break;
                 case "w":
                     if (v.matches("preset:\\d+")) prefs.edit().putString(KEY_WALL, v).apply();
                     break;
@@ -447,6 +528,7 @@ public class MainActivity extends Activity {
                 .putString(KEY_SHORTCUTS, TextUtils.join(",", shortcuts))
                 .putString(KEY_PINNED, TextUtils.join(",", pinned))
                 .putString(KEY_MODES, modesCsv())
+                .putString(KEY_POS, posCsv())
                 .apply();
         applyWallpaper();
         refreshDesktopIcons();
@@ -474,13 +556,14 @@ public class MainActivity extends Activity {
         desktopArea.setOnClickListener(v -> closeOverlays());
         desktopArea.setOnLongClickListener(v -> { showDesktopMenu(); return true; });
 
-        // Ícones do desktop: fileira centralizada na parte de baixo, como no DeX.
-        iconFlow = new BottomFlow(this, dp(100), dp(108), dp(14));
+        // Ícones do desktop: grade no canto superior esquerdo (colunas de cima para baixo), como no Windows.
+        iconFlow = new IconGrid(this, dp(96), dp(104), dp(10));
+        iconFlow.onMoved = this::onIconsMoved;
         desktopArea.addView(iconFlow, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
         emptyHint = new TextView(this);
-        emptyHint.setText("Segure um app no menu de apps para colocá-lo aqui.\nSegure o fundo para trocar o papel de parede.");
+        emptyHint.setText("Segure um app no menu de apps para colocá-lo aqui.\nSegure o fundo para papel de parede e organização dos ícones.");
         emptyHint.setTextColor(0xAAFFFFFF);
         emptyHint.setTextSize(14);
         emptyHint.setGravity(Gravity.CENTER);
@@ -1054,28 +1137,93 @@ public class MainActivity extends Activity {
     }
 
     private void refreshDesktopIcons() {
-        iconFlow.removeAllViews();
+        iconFlow.clearIcons();
+        gridPkgs.clear();
         int shown = 0;
         for (String pkg : shortcuts) {
             final AppEntry e = find(pkg);
             if (e == null) continue;
             shown++;
             View cell = makeIconCell(e);
-            cell.setOnClickListener(v -> launchApp(e.pkg));
-            cell.setOnLongClickListener(v -> { showAppMenu(e); return true; });
-            iconFlow.addView(cell);
+            attachIconTouch(cell, e);
+            iconFlow.addIcon(cell, iconsFree ? iconPos.get(pkg) : null);
+            gridPkgs.add(pkg);
         }
         emptyHint.setVisibility(shown == 0 ? View.VISIBLE : View.GONE);
     }
 
+    /** Toque: abre. Segurar parado: menu. Segurar e arrastar: move o ícone (se "arrastar ícones" estiver ligado). */
+    private void attachIconTouch(final View cell, final AppEntry e) {
+        final float[] down = new float[2];
+        final boolean[] st = new boolean[2];   // st[0] = arrastando, st[1] = menu já aberto
+        final int slop = dp(8);
+        final Runnable longPress = () -> { if (!st[0]) { st[1] = true; showAppMenu(e); } };
+        cell.setOnTouchListener((v, ev) -> {
+            switch (ev.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                    down[0] = ev.getRawX(); down[1] = ev.getRawY();
+                    st[0] = false; st[1] = false;
+                    handler.postDelayed(longPress, 450);
+                    return true;
+                case MotionEvent.ACTION_MOVE: {
+                    float dx = ev.getRawX() - down[0], dy = ev.getRawY() - down[1];
+                    if (!st[0] && !st[1] && iconsFree && Math.hypot(dx, dy) > slop) {
+                        st[0] = true;
+                        handler.removeCallbacks(longPress);
+                        v.bringToFront();
+                        v.setAlpha(0.75f);
+                        if (v.getParent() != null) v.getParent().requestDisallowInterceptTouchEvent(true);
+                    }
+                    if (st[0]) { v.setTranslationX(dx); v.setTranslationY(dy); }
+                    return true;
+                }
+                case MotionEvent.ACTION_UP:
+                    handler.removeCallbacks(longPress);
+                    if (st[0]) iconFlow.drop(v);
+                    else if (!st[1]) launchApp(e.pkg);
+                    st[0] = false;
+                    return true;
+                case MotionEvent.ACTION_CANCEL:
+                    handler.removeCallbacks(longPress);
+                    if (st[0]) { v.setTranslationX(0); v.setTranslationY(0); v.setAlpha(1f); }
+                    st[0] = false;
+                    return true;
+                default:
+                    return true;
+            }
+        });
+    }
+
+    /** A grade avisa que um ícone foi solto: guarda a posição de todos (nada "pula" depois). */
+    private void onIconsMoved() {
+        for (int i = 0; i < gridPkgs.size(); i++) {
+            int[] c = iconFlow.cellOf(i);
+            if (c != null) iconPos.put(gridPkgs.get(i), c);
+        }
+        saveState();
+    }
+
     private void showDesktopMenu() {
+        final String freeTxt = iconsFree ? "Arrastar ícones: ligado (tocar para desligar)"
+                                         : "Arrastar ícones: desligado (tocar para ligar)";
         new AlertDialog.Builder(this)
-                .setItems(new String[]{"Papel de parede…", "Arquivos", "Todos os apps", "Sobre / versão"},
+                .setItems(new String[]{"Papel de parede…", "Arquivos", "Todos os apps",
+                                "Organizar ícones automaticamente", freeTxt, "Sobre / versão"},
                         (d, which) -> {
                             if (which == 0) showWallpaperMenu();
                             else if (which == 1) openFiles();
                             else if (which == 2) showDrawer();
-                            else showAbout();
+                            else if (which == 3) {
+                                iconPos.clear();
+                                saveState();
+                                refreshDesktopIcons();
+                                toast("Ícones organizados");
+                            } else if (which == 4) {
+                                iconsFree = !iconsFree;
+                                prefs.edit().putBoolean(KEY_FREE, iconsFree).apply();
+                                refreshDesktopIcons();
+                                toast(iconsFree ? "Arrastar ícones: ligado" : "Arrastar ícones: desligado (organização automática)");
+                            } else showAbout();
                         }).show();
     }
 
@@ -1488,15 +1636,90 @@ public class MainActivity extends Activity {
         }
     }
 
-    /** Ícones do desktop: fileira centralizada embaixo (como o DeX); se não couber, sobe para a próxima fileira. */
-    private static class BottomFlow extends ViewGroup {
-        private final int cellW, cellH, margin;
+    /**
+     * Ícones do desktop numa grade a partir do canto superior esquerdo (colunas de cima para baixo, como no Windows).
+     * Cada ícone pode ter uma célula pedida; se ela não existir mais (tela menor) ou estiver ocupada, o ícone vai
+     * para a primeira célula livre. Assim nada fica fora da tela nem sobreposto, em qualquer resolução.
+     */
+    private static class IconGrid extends ViewGroup {
+        private final int cellW, cellH, pad;
+        private int cols = 1, rows = 1;
+        private final List<int[]> want = new ArrayList<>();   // célula pedida por ícone ({-1,-1} = automática)
+        private int[][] eff = new int[0][];                   // célula efetiva (já ajustada à tela)
+        Runnable onMoved;
 
-        BottomFlow(Context c, int cellW, int cellH, int margin) {
+        IconGrid(Context c, int cellW, int cellH, int pad) {
             super(c);
             this.cellW = cellW;
             this.cellH = cellH;
-            this.margin = margin;
+            this.pad = pad;
+        }
+
+        void addIcon(View v, int[] cell) {
+            addView(v);
+            want.add(cell == null ? new int[]{-1, -1} : new int[]{cell[0], cell[1]});
+        }
+
+        void clearIcons() {
+            removeAllViews();
+            want.clear();
+            eff = new int[0][];
+        }
+
+        int[] cellOf(int i) {
+            return i >= 0 && i < eff.length && eff[i] != null ? new int[]{eff[i][0], eff[i][1]} : null;
+        }
+
+        private void computeEffective(int w, int h) {
+            cols = Math.max(1, (w - 2 * pad) / cellW);
+            rows = Math.max(1, (h - 2 * pad) / cellH);
+            int n = getChildCount();
+            eff = new int[n][];
+            boolean[][] used = new boolean[cols][rows];
+            for (int i = 0; i < n; i++) {
+                int[] p = want.get(i);
+                if (p[0] >= 0 && p[0] < cols && p[1] >= 0 && p[1] < rows && !used[p[0]][p[1]]) {
+                    eff[i] = new int[]{p[0], p[1]};
+                    used[p[0]][p[1]] = true;
+                }
+            }
+            for (int i = 0; i < n; i++) {
+                if (eff[i] != null) continue;
+                boolean placed = false;
+                for (int c = 0; c < cols && !placed; c++) {
+                    for (int r = 0; r < rows && !placed; r++) {
+                        if (!used[c][r]) {
+                            used[c][r] = true;
+                            eff[i] = new int[]{c, r};
+                            placed = true;
+                        }
+                    }
+                }
+                if (!placed) eff[i] = new int[]{cols - 1, rows - 1};   // mais ícones que células: sobrepõe no fim
+            }
+        }
+
+        /** Soltou o ícone: encaixa na célula mais próxima (se ocupada, troca de lugar com o ocupante). */
+        void drop(View v) {
+            int i = indexOfChild(v);
+            if (i < 0 || i >= eff.length) { v.setTranslationX(0); v.setTranslationY(0); v.setAlpha(1f); return; }
+            float cx = v.getLeft() + v.getTranslationX() + cellW / 2f;
+            float cy = v.getTop() + v.getTranslationY() + cellH / 2f;
+            int c = Math.max(0, Math.min(cols - 1, (int) ((cx - pad) / cellW)));
+            int r = Math.max(0, Math.min(rows - 1, (int) ((cy - pad) / cellH)));
+            int[] from = eff[i];
+            for (int j = 0; j < eff.length; j++) {
+                if (j == i) continue;
+                int[] e = eff[j];
+                want.set(j, (e[0] == c && e[1] == r) ? new int[]{from[0], from[1]} : new int[]{e[0], e[1]});
+            }
+            want.set(i, new int[]{c, r});
+            v.setTranslationX(0);
+            v.setTranslationY(0);
+            v.setAlpha(1f);
+            computeEffective(getWidth(), getHeight());
+            requestLayout();
+            if (onMoved != null) onMoved.run();
         }
 
         @Override
@@ -1511,15 +1734,9 @@ public class MainActivity extends Activity {
 
         @Override
         protected void onLayout(boolean changed, int l, int t, int r, int b) {
-            int w = r - l, h = b - t;
-            int perRow = Math.max(1, w / cellW);
-            int n = getChildCount();
-            for (int i = 0; i < n; i++) {
-                int row = i / perRow, col = i % perRow;
-                int inRow = Math.min(perRow, n - row * perRow);
-                int x0 = (w - inRow * cellW) / 2;
-                int left = x0 + col * cellW;
-                int top = Math.max(0, h - margin - (row + 1) * cellH);
+            computeEffective(r - l, b - t);
+            for (int i = 0; i < getChildCount(); i++) {
+                int left = pad + eff[i][0] * cellW, top = pad + eff[i][1] * cellH;
                 getChildAt(i).layout(left, top, left + cellW, top + cellH);
             }
         }
