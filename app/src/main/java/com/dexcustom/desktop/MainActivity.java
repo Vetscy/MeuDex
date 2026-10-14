@@ -96,7 +96,7 @@ import java.util.regex.Pattern;
  */
 public class MainActivity extends Activity {
 
-    static final String VERSION = "0.5.1";
+    static final String VERSION = "0.5.2";
 
     private static final String TAG = "MeuDex";
     private static final String PREFS = "meudex_prefs";
@@ -1477,7 +1477,30 @@ public class MainActivity extends Activity {
 
     private int modeOf(String pkg) {
         Integer m = modes.get(pkg);
-        return m == null ? MODE_WINDOW : m;
+        // Jogos sem modo escolhido por você abrem em TELA CHEIA: abrir um jogo em janela com tamanho forçado
+        // recria a superfície dele (tela preta/travamento).
+        return m == null ? (isGame(pkg) ? MODE_FULL : MODE_WINDOW) : m;
+    }
+
+    private final java.util.HashMap<String, Boolean> gameCache = new java.util.HashMap<>();
+
+    /** Jogo = marcado como jogo pelo Android (categoria/flag) ou um dos jogos conhecidos. */
+    private boolean isGame(String pkg) {
+        Boolean c = gameCache.get(pkg);
+        if (c != null) return c;
+        boolean g = false;
+        try {
+            android.content.pm.ApplicationInfo ai = pm.getApplicationInfo(pkg, 0);
+            g = ai.category == android.content.pm.ApplicationInfo.CATEGORY_GAME
+                    || (ai.flags & android.content.pm.ApplicationInfo.FLAG_IS_GAME) != 0;
+        } catch (Throwable ignored) { }
+        if (!g) {
+            g = pkg.equals("com.axlebolt.standoff2") || pkg.equals("com.activision.callofduty.shooter")
+                    || pkg.equals("com.garena.game.codm") || pkg.equals("com.tencent.tmgp.cod")
+                    || pkg.equals("com.rockstargames.gtasa");
+        }
+        gameCache.put(pkg, g);
+        return g;
     }
 
     /** Abrir com o modo lembrado. App já aberto: só traz a janela para frente (mantém tamanho e posição). */
